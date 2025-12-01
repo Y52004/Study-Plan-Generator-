@@ -24,7 +24,7 @@ AI-powered personalized study plan generation using 5 specialized CrewAI agents 
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/yourusername/CNNproj.git
+git clone https://github.com/Y52004/Study-Plan-Generator-.git
 cd CNNproj
 ```
 
@@ -200,3 +200,4 @@ For issues or questions:
 ---
 
 **Built with ❤️ using CrewAI and Google Gemini**
+
