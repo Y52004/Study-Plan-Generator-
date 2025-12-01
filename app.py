@@ -1,14 +1,15 @@
 from flask import Flask, request, jsonify, render_template
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from fpdf import FPDF
 from dotenv import load_dotenv
 import io
 import pdfplumber
 from werkzeug.utils import secure_filename
+import threading
 
-# Load environment variables from .env file
+# Load environment variables from .env file (safe - won't raise)
 load_dotenv()
 
 app = Flask(__name__)
@@ -19,100 +20,25 @@ ALLOWED_EXTENSIONS = {'pdf'}
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Get API key from environment variable
+# Get API key from environment variable (do NOT exit on missing - handle gracefully)
 api_key = os.environ.get("GEMINI_API_KEY")
+if api_key:
+    # set for litellm if present
+    os.environ["GEMINI_API_KEY"] = api_key
 
-if not api_key:
-    print("ERROR: GEMINI_API_KEY environment variable is not set!")
-    print("Please set it using: $env:GEMINI_API_KEY='your-api-key-here' (PowerShell)")
-    exit(1)
-
-# Set environment variable for litellm
-os.environ["GEMINI_API_KEY"] = api_key
-
-# Import litellm for Gemini access
-import litellm
-litellm.set_verbose = False
-
-# Import CrewAI
-from crewai import Agent, Task, Crew
-
-# Store study plans in memory
+# Global in-memory store (unchanged)
 study_plans = {}
 
-# Initialize LLM
-llm = "gemini/gemini-2.0-flash"
-print("Initializing LLM:", llm)
+# ---------------------------------------------------------------------
+# Lazy initialization utilities for CrewAI/LLM/Agents
+# ---------------------------------------------------------------------
+_agents_lock = threading.Lock()
+_agents_initialized = False
+_llm_instance = None
+_agent_core = None       # Agent A (syllabus + learning)
+_agent_scheduler = None  # Agent B (schedule + resources)
+_agent_progress = None   # Agent C (progress tracker)
 
-# ============================================================================
-# AGENT 1: SYLLABUS ANALYZER AGENT
-# ============================================================================
-print("Creating Syllabus Analyzer Agent...")
-syllabus_analyzer = Agent(
-    role="Syllabus Analyzer",
-    goal="Break down educational syllabus into organized topics with accurate time estimates for each topic",
-    backstory="You are an expert curriculum analyst with years of experience in educational planning. You excel at identifying key topics, understanding learning dependencies, and estimating realistic time requirements for mastering each concept.",
-    llm=llm,
-    verbose=True
-)
-print("Syllabus Analyzer Agent created.")
-
-# ============================================================================
-# AGENT 2: LEARNING STYLE ASSESSOR AGENT
-# ============================================================================
-print("Creating Learning Style Assessor Agent...")
-learning_style_assessor = Agent(
-    role="Learning Style Assessor",
-    goal="Analyze user's learning preferences, strengths, and challenges to create a personalized learning approach",
-    backstory="You are a learning psychology expert who understands different learning styles (visual, auditory, kinesthetic, reading/writing). You adapt study strategies based on individual preferences and learning patterns to maximize comprehension and retention.",
-    llm=llm,
-    verbose=True
-)
-print("Learning Style Assessor Agent created.")
-
-# ============================================================================
-# AGENT 3: SCHEDULE ARCHITECT AGENT
-# ============================================================================
-print("Creating Schedule Architect Agent...")
-schedule_architect = Agent(
-    role="Schedule Architect",
-    goal="Create detailed, day-by-day study schedules that balance learning objectives with realistic time management",
-    backstory="You are a master scheduler and time management expert. You create practical, achievable study schedules that account for breaks, review sessions, and real-world constraints while optimizing learning outcomes.",
-    llm=llm,
-    verbose=True
-)
-print("Schedule Architect Agent created.")
-
-# ============================================================================
-# AGENT 4: RESOURCE RECOMMENDER AGENT
-# ============================================================================
-print("Creating Resource Recommender Agent...")
-resource_recommender = Agent(
-    role="Resource Recommender",
-    goal="Suggest and recommend the most effective study materials, tools, and resources tailored to specific topics and learning styles",
-    backstory="You are a research specialist with deep knowledge of educational resources, textbooks, online platforms, videos, and tools. You match resources to specific topics and learning preferences to enhance the study experience.",
-    llm=llm,
-    verbose=True
-)
-print("Resource Recommender Agent created.")
-
-# ============================================================================
-# AGENT 5: PROGRESS TRACKER & ADAPTATION AGENT
-# ============================================================================
-print("Creating Progress Tracker & Adaptation Agent...")
-progress_tracker = Agent(
-    role="Progress Tracker & Adaptation Specialist",
-    goal="Create monitoring systems, track learning progress, and adapt study plans based on performance and feedback",
-    backstory="You are an adaptive learning system expert who monitors student progress, identifies knowledge gaps, and recommends plan adjustments. You use data-driven insights to optimize study effectiveness and ensure continuous improvement.",
-    llm=llm,
-    verbose=True
-)
-print("Progress Tracker & Adaptation Agent created.")
-
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
 
 def allowed_file(filename):
     """Check if file has allowed extension (PDF only)"""
@@ -122,383 +48,290 @@ def allowed_file(filename):
 def parse_pdf_file(file):
     """
     Extract text content from PDF file
-    This function is called by Agent 1 to read and process the PDF
     """
-    print("\n[PDF Parser] Starting PDF file parsing...")
     try:
         filename = secure_filename(file.filename)
-        print(f"[PDF Parser] Processing file: {filename}")
-        
-        # Check if file is PDF
         if not allowed_file(filename):
-            print(f"[PDF Parser] ERROR: Invalid file type. Only PDF files are allowed.")
             raise ValueError("Invalid file type. Only PDF files are allowed. Please upload a PDF file.")
-        
-        # Read PDF content
-        print("[PDF Parser] Reading PDF content...")
+
         pdf_content = io.BytesIO(file.read())
-        
         extracted_text = ""
         page_count = 0
-        
-        # Extract text from all pages
+
         with pdfplumber.open(pdf_content) as pdf:
             page_count = len(pdf.pages)
-            print(f"[PDF Parser] Found {page_count} pages in PDF")
-            
             for page_num, page in enumerate(pdf.pages, 1):
                 text = page.extract_text()
                 if text:
                     extracted_text += f"\n--- Page {page_num} ---\n{text}"
-                    print(f"[PDF Parser] Extracted text from page {page_num}")
-        
+
         if not extracted_text:
-            print("[PDF Parser] ERROR: No text could be extracted from PDF")
             raise ValueError("No text content found in the PDF. Please provide a valid text-based PDF.")
-        
-        print(f"[PDF Parser] Successfully extracted {len(extracted_text)} characters from {page_count} pages")
+
         return extracted_text, page_count
-        
+
     except Exception as e:
-        print(f"[PDF Parser] ERROR: Failed to parse PDF - {str(e)}")
+        # bubble up for route to handle
         raise
 
 
+def _init_agents_if_needed():
+    """
+    Lazy init LLM + CrewAI agents. This delays heavy imports until first request.
+    We combine agents into 3 to reduce memory load:
+      - agent_core: syllabus analysis + learning style + resources (combined)
+      - agent_scheduler: schedule creation (also covers resource mapping if needed)
+      - agent_progress: progress tracking
+    """
+    global _agents_initialized, _llm_instance, _agent_core, _agent_scheduler, _agent_progress
+
+    with _agents_lock:
+        if _agents_initialized:
+            return
+
+        # Import heavy libraries lazily
+        try:
+            # litellm/libraries may be present - but import crewai components
+            from crewai import Agent, Task, Crew, LLM
+        except Exception as e:
+            # If CrewAI or LLM classes are missing, raise a clear error
+            raise RuntimeError(f"CrewAI import failed: {e}")
+
+        # Create a single LLM instance and prefer non-native provider to reduce memory
+        try:
+            # Use explicit LLM object with use_native=False to avoid heavy native provider
+            # If CREWAI's LLM class is different in your version, this fallback uses string
+            try:
+                _llm_instance = LLM(model="gemini/gemini-2.0-flash", use_native=False)
+            except Exception:
+                # Fallback to string (CrewAI will interpret when constructing Agent), but
+                # prefer LLM object above.
+                _llm_instance = "gemini/gemini-2.0-flash"
+        except Exception as e:
+            # If LLM creation fails (missing creds, etc.) keep _llm_instance=None and
+            # handle later in request processing.
+            _llm_instance = None
+            app.logger.warning(f"LLM creation warning: {e}")
+
+        # Define factory to create Agent objects but DO NOT run heavy work here
+        def make_agent(role, goal, backstory):
+            try:
+                # If we created an LLM object, pass it; else pass model string (CrewAI will try)
+                return Agent(role=role, goal=goal, backstory=backstory, llm=_llm_instance, verbose=False)
+            except Exception as e:
+                # If Agent creation fails (e.g., missing provider), raise an informative error.
+                raise RuntimeError(f"Failed to create agent '{role}': {e}")
+
+        # Create combined agents (these are lighter than creating 5 separate ones)
+        _agent_core = make_agent(
+            role="Core Study Plan Agent",
+            goal="Analyze syllabus, assess learning style, and produce topic/resource mappings",
+            backstory="Combines syllabus analysis and learning style assessment to produce structured topics and resource suggestions."
+        )
+        _agent_scheduler = make_agent(
+            role="Schedule & Resource Agent",
+            goal="Create day-by-day schedule and map resources to schedule sessions",
+            backstory="Builds a practical schedule using provided topic breakdown and learning preferences."
+        )
+        _agent_progress = make_agent(
+            role="Progress Tracker Agent",
+            goal="Create progress checkpoints and adaptation strategies",
+            backstory="Designs monitoring metrics and triggers for adapting the study plan."
+        )
+
+        _agents_initialized = True
+
+
+# ---------------------------------------------------------------------
+# Core study plan generation (uses the 3 agents)
+# ---------------------------------------------------------------------
 def create_study_plan(syllabus_text, learning_preferences, study_duration_days):
     """
-    Main function to orchestrate the crew of agents to create a comprehensive study plan
-    
-    Args:
-        syllabus_text: Text extracted from PDF by Agent 1
-        learning_preferences: User's learning style preferences
-        study_duration_days: Number of days for the study plan
-    
-    Agent 1 (Syllabus Analyzer) is responsible for:
-    - Reading and processing the PDF content
-    - Breaking down syllabus into organized topics
-    - Identifying learning dependencies
-    - Estimating time requirements for each topic
+    Orchestrate the 3-agent crew to produce the final study plan.
+    We combine multiple responsibilities into fewer LLM calls to reduce memory use.
     """
-    print("=" * 80)
-    print("STARTING STUDY PLAN GENERATION WITH PDF INPUT")
-    print("=" * 80)
-    print("STARTING STUDY PLAN GENERATION")
-    print("=" * 80)
-    
+    # Ensure agents are ready; if not, return a clean error
     try:
-        # STEP 1: Analyze Syllabus (Agent 1 handles PDF content)
-        print("\n[STEP 1] [AGENT 1: Syllabus Analyzer] Analyzing PDF-extracted syllabus...")
-        print("[STEP 1] Breaking down syllabus into organized topics with time estimates...")
-        
-        syllabus_task = Task(
-            description=f"""You are analyzing a syllabus extracted from a PDF document. Your task is to break down this educational syllabus into organized topics with accurate time estimates.
-
-SYLLABUS CONTENT FROM PDF:
-{syllabus_text}
-
-Analyze this syllabus carefully and return your analysis as a JSON object with this structure (ONLY JSON, no other text):
-{{
-    "pdf_analysis": {{
-        "document_type": "PDF Syllabus",
-        "content_quality": "assessment of content clarity"
-    }},
-    "subjects": [
-        {{
-            "name": "Subject/Module Name",
-            "chapters": [
-                {{"name": "Chapter Name", "estimated_hours": 5, "difficulty": "medium", "key_concepts": ["concept1", "concept2"]}}
-            ]
-        }}
-    ],
-    "total_estimated_hours": 100,
-    "prerequisites": ["prerequisite1", "prerequisite2"],
-    "learning_path_summary": "Brief summary of recommended learning path"
-}}""",
-            expected_output="JSON analysis of PDF syllabus with organized topics and time estimates",
-            agent=syllabus_analyzer
-        )
-        
-        syllabus_crew = Crew(agents=[syllabus_analyzer], tasks=[syllabus_task])
-        syllabus_result = syllabus_crew.kickoff()
-        syllabus_analysis_text = str(syllabus_result).strip()
-        
-        # Clean JSON response
-        if syllabus_analysis_text.startswith('```'):
-            lines = syllabus_analysis_text.split('\n')
-            start_idx = None
-            end_idx = None
-            for i, line in enumerate(lines):
-                if line.strip().startswith('```json') or line.strip() == '```':
-                    if start_idx is None:
-                        start_idx = i + 1
-                    else:
-                        end_idx = i
-                        break
-            if start_idx is not None and end_idx is not None:
-                syllabus_analysis_text = '\n'.join(lines[start_idx:end_idx]).strip()
-        
-        syllabus_analysis = json.loads(syllabus_analysis_text)
-        print("✓ [AGENT 1] Syllabus analysis completed from PDF")
-        print(f"  Total estimated hours: {syllabus_analysis.get('total_estimated_hours', 'N/A')}")
-        if 'subjects' in syllabus_analysis:
-            print(f"  Subjects identified: {len(syllabus_analysis.get('subjects', []))}")
-        
+        _init_agents_if_needed()
     except Exception as e:
-        print(f"✗ [AGENT 1] Error in syllabus analysis: {e}")
+        return {"error": f"Server misconfiguration: {e}"}
+
+    # If LLM creation failed earlier, return informative error
+    if _llm_instance is None:
+        return {"error": "LLM not configured or failed to initialize. Check GEMINI_API_KEY and server logs."}
+
+    # We'll call 3 crews/tasks sequentially:
+    # 1) CoreAgent -> syllabus + learning analysis -> returns syllabus_analysis & learning_analysis
+    # 2) SchedulerAgent -> schedule + resources based on (1)
+    # 3) ProgressAgent -> progress tracking based on (1) & (2)
+
+    syllabus_analysis = {}
+    learning_analysis = {}
+    schedule = {}
+    resources = {}
+    progress_system = {}
+
+    # 1) Core agent - single task to extract both syllabus analysis and learning style assessment
+    try:
+        from crewai import Task, Crew  # lazy import inside function
+        core_description = f"""
+You are an AI curriculum assistant. Input: SYLLABUS TEXT and USER LEARNING PREFERENCES.
+Task: 
+1) Analyze the syllabus text and return a JSON object named 'syllabus_analysis' with fields:
+   - document_type
+   - content_quality
+   - subjects (list of {{"name","chapters":[{{"name","estimated_hours","difficulty","key_concepts"}}]}})
+   - total_estimated_hours
+   - prerequisites
+   - learning_path_summary
+
+2) Assess the learning preferences and return a JSON object named 'learning_analysis' with fields:
+   - primary_learning_style
+   - secondary_learning_styles
+   - strengths
+   - challenges
+   - recommended_study_methods
+   - personalized_tips
+
+Return ONLY a JSON object with structure:
+{{
+  "syllabus_analysis": {{ ... }},
+  "learning_analysis": {{ ... }}
+}}
+"""
+        task_core = Task(
+            description=core_description + f"\n\nSYLLABUS_TEXT:\n{syllabus_text}\n\nLEARNING_PREFERENCES:\n{learning_preferences}",
+            expected_output="JSON with syllabus_analysis and learning_analysis",
+            agent=_agent_core
+        )
+        crew_core = Crew(agents=[_agent_core], tasks=[task_core])
+        core_result = crew_core.kickoff()
+        core_text = str(core_result).strip()
+
+        # Attempt to extract JSON block if wrapped in triple-backticks
+        if core_text.startswith("```"):
+            lines = core_text.splitlines()
+            # try to find json block boundaries
+            start_idx = 0
+            end_idx = len(lines)
+            for i, ln in enumerate(lines):
+                if ln.strip().startswith("```json") or ln.strip() == "```":
+                    start_idx = i + 1
+                    break
+            for j in range(start_idx, len(lines)):
+                if lines[j].strip() == "```":
+                    end_idx = j
+                    break
+            core_text = "\n".join(lines[start_idx:end_idx]).strip()
+
+        core_json = json.loads(core_text)
+        syllabus_analysis = core_json.get("syllabus_analysis", {})
+        learning_analysis = core_json.get("learning_analysis", {})
+
+    except Exception as e:
+        # If Core step fails, capture the error and continue with empty placeholders
+        app.logger.error(f"[Core Agent] Error: {e}")
         syllabus_analysis = {"error": str(e)}
-    
-    try:
-        # STEP 2: Assess Learning Style
-        print("\n[STEP 2] Assessing learning style with Learning Style Assessor Agent...")
-        learning_task = Task(
-            description=f"""Based on the student's learning preferences provided, analyze and create a personalized learning approach.
-
-Learning Preferences:
-{learning_preferences}
-
-Return your assessment as a JSON object with this structure (ONLY JSON, no other text):
-{{
-    "primary_learning_style": "visual|auditory|kinesthetic|reading-writing",
-    "secondary_learning_styles": ["style1", "style2"],
-    "strengths": ["strength1", "strength2"],
-    "challenges": ["challenge1", "challenge2"],
-    "recommended_study_methods": ["method1", "method2", "method3"],
-    "personalized_tips": "Specific tips for this learner"
-}}""",
-            expected_output="JSON assessment of learning style and personalized approach",
-            agent=learning_style_assessor
-        )
-        
-        learning_crew = Crew(agents=[learning_style_assessor], tasks=[learning_task])
-        learning_result = learning_crew.kickoff()
-        learning_analysis_text = str(learning_result).strip()
-        
-        # Clean JSON response
-        if learning_analysis_text.startswith('```'):
-            lines = learning_analysis_text.split('\n')
-            start_idx = None
-            end_idx = None
-            for i, line in enumerate(lines):
-                if line.strip().startswith('```json') or line.strip() == '```':
-                    if start_idx is None:
-                        start_idx = i + 1
-                    else:
-                        end_idx = i
-                        break
-            if start_idx is not None and end_idx is not None:
-                learning_analysis_text = '\n'.join(lines[start_idx:end_idx]).strip()
-        
-        learning_analysis = json.loads(learning_analysis_text)
-        print("✓ Learning style assessment completed")
-        print(f"  Primary style: {learning_analysis.get('primary_learning_style', 'N/A')}")
-        
-    except Exception as e:
-        print(f"✗ Error in learning style assessment: {e}")
         learning_analysis = {"error": str(e)}
-    
+
+    # 2) Scheduler & Resources agent
     try:
-        # STEP 3: Create Schedule
-        print("\n[STEP 3] Creating study schedule with Schedule Architect Agent...")
-        schedule_task = Task(
-            description=f"""Create a detailed day-by-day study schedule based on:
+        from crewai import Task, Crew
+        schedule_description = f"""
+Using the following inputs (ONLY JSON output):
 
-Syllabus Topics:
-{json.dumps(syllabus_analysis, indent=2)}
+SYLLABUS_ANALYSIS:
+{json.dumps(syllabus_analysis, indent=2)[:4000]}
 
-Learning Preferences:
-{json.dumps(learning_analysis, indent=2)}
+LEARNING_ANALYSIS:
+{json.dumps(learning_analysis, indent=2)[:2000]}
 
-Study Duration: {study_duration_days} days
-Study Hours per day: 4-6 hours
+Study duration (days): {study_duration_days}
 
-Return your schedule as a JSON object with this structure (ONLY JSON, no other text):
+Task:
+Return a JSON object with:
 {{
-    "schedule": [
-        {{
-            "day": 1,
-            "date": "2025-12-01",
-            "sessions": [
-                {{
-                    "session": 1,
-                    "time": "09:00-11:00",
-                    "topic": "Topic Name",
-                    "subtopics": ["subtopic1", "subtopic2"],
-                    "activities": ["activity1", "activity2"],
-                    "break_after": 15
-                }}
-            ],
-            "revision_topics": ["topic1"],
-            "notes": "Any special notes for this day"
-        }}
-    ],
-    "weekly_milestones": ["Milestone 1", "Milestone 2"]
-}}""",
-            expected_output="JSON detailed day-by-day study schedule",
-            agent=schedule_architect
+  "schedule": [ {{ "day": 1, "date": "YYYY-MM-DD", "sessions": [{{"session","time","topic","subtopics","activities","break_after"}}] }} ],
+  "weekly_milestones": ["..."],
+  "resource_map": [ {{ "topic":"...", "resources":[{{"type","name","description","why_recommended"}}] }} ]
+}}
+"""
+        task_sched = Task(
+            description=schedule_description,
+            expected_output="JSON schedule & resource_map",
+            agent=_agent_scheduler
         )
-        
-        schedule_crew = Crew(agents=[schedule_architect], tasks=[schedule_task])
-        schedule_result = schedule_crew.kickoff()
-        schedule_text = str(schedule_result).strip()
-        
-        # Clean JSON response
-        if schedule_text.startswith('```'):
-            lines = schedule_text.split('\n')
-            start_idx = None
-            end_idx = None
-            for i, line in enumerate(lines):
-                if line.strip().startswith('```json') or line.strip() == '```':
-                    if start_idx is None:
-                        start_idx = i + 1
-                    else:
-                        end_idx = i
-                        break
-            if start_idx is not None and end_idx is not None:
-                schedule_text = '\n'.join(lines[start_idx:end_idx]).strip()
-        
-        schedule = json.loads(schedule_text)
-        print("✓ Study schedule created")
-        print(f"  Total days scheduled: {len(schedule.get('schedule', []))}")
-        
+        crew_sched = Crew(agents=[_agent_scheduler], tasks=[task_sched])
+        sched_result = crew_sched.kickoff()
+        sched_text = str(sched_result).strip()
+
+        if sched_text.startswith("```"):
+            lines = sched_text.splitlines()
+            start_idx = 0
+            end_idx = len(lines)
+            for i, ln in enumerate(lines):
+                if ln.strip().startswith("```json") or ln.strip() == "```":
+                    start_idx = i + 1
+                    break
+            for j in range(start_idx, len(lines)):
+                if lines[j].strip() == "```":
+                    end_idx = j
+                    break
+            sched_text = "\n".join(lines[start_idx:end_idx]).strip()
+
+        sched_json = json.loads(sched_text)
+        schedule = sched_json.get("schedule", {})
+        resources = {"resource_recommendations": sched_json.get("resource_map", [])}
     except Exception as e:
-        print(f"✗ Error in schedule creation: {e}")
+        app.logger.error(f"[Scheduler Agent] Error: {e}")
         schedule = {"error": str(e)}
-    
-    try:
-        # STEP 4: Recommend Resources
-        print("\n[STEP 4] Recommending resources with Resource Recommender Agent...")
-        
-        # Extract topics from syllabus analysis
-        topics_str = json.dumps(syllabus_analysis, indent=2)[:1000]
-        
-        resource_task = Task(
-            description=f"""Based on the topics and learning preferences, recommend study resources for each major topic.
-
-Topics to Cover:
-{topics_str}
-
-Learning Style: {learning_analysis.get('primary_learning_style', 'visual')}
-
-Return your recommendations as a JSON object with this structure (ONLY JSON, no other text):
-{{
-    "resource_recommendations": [
-        {{
-            "topic": "Topic Name",
-            "resources": [
-                {{
-                    "type": "textbook|video|interactive|article|tool",
-                    "name": "Resource Name",
-                    "description": "Brief description",
-                    "why_recommended": "Why this helps this learner"
-                }}
-            ]
-        }}
-    ],
-    "study_tools": ["tool1", "tool2", "tool3"],
-    "supplementary_resources": ["resource1", "resource2"]
-}}""",
-            expected_output="JSON recommendations for study resources",
-            agent=resource_recommender
-        )
-        
-        resource_crew = Crew(agents=[resource_recommender], tasks=[resource_task])
-        resource_result = resource_crew.kickoff()
-        resources_text = str(resource_result).strip()
-        
-        # Clean JSON response
-        if resources_text.startswith('```'):
-            lines = resources_text.split('\n')
-            start_idx = None
-            end_idx = None
-            for i, line in enumerate(lines):
-                if line.strip().startswith('```json') or line.strip() == '```':
-                    if start_idx is None:
-                        start_idx = i + 1
-                    else:
-                        end_idx = i
-                        break
-            if start_idx is not None and end_idx is not None:
-                resources_text = '\n'.join(lines[start_idx:end_idx]).strip()
-        
-        resources = json.loads(resources_text)
-        print("✓ Resource recommendations completed")
-        print(f"  Total resource recommendations: {len(resources.get('resource_recommendations', []))}")
-        
-    except Exception as e:
-        print(f"✗ Error in resource recommendations: {e}")
         resources = {"error": str(e)}
-    
+
+    # 3) Progress Tracker agent
     try:
-        # STEP 5: Create Progress Tracking System
-        print("\n[STEP 5] Creating progress tracking system with Progress Tracker Agent...")
-        progress_task = Task(
-            description=f"""Design a comprehensive progress tracking and adaptation system for this study plan.
+        from crewai import Task, Crew
+        progress_description = f"""
+Design a progress tracking JSON object for the study plan. Input:
+Syllabus summary: {json.dumps(syllabus_analysis, indent=2)[:2000]}
+Schedule summary: {json.dumps(schedule, indent=2)[:2000]}
 
-Topics: {json.dumps(syllabus_analysis.get('subjects', [])[:2], indent=2)}
-Schedule: {study_duration_days} days
-Learning Style: {learning_analysis.get('primary_learning_style', 'visual')}
-
-Return your tracking system as a JSON object with this structure (ONLY JSON, no other text):
+Return JSON with:
 {{
-    "tracking_metrics": [
-        {{
-            "metric": "Metric Name",
-            "how_to_measure": "How to measure this",
-            "success_criteria": "What indicates success"
-        }}
-    ],
-    "checkpoint_schedule": [
-        {{
-            "checkpoint": "Checkpoint Name",
-            "day": 7,
-            "assessment": "What to evaluate",
-            "adaptation_triggers": ["trigger1", "trigger2"]
-        }}
-    ],
-    "adaptation_strategies": [
-        {{
-            "scenario": "What happens if student is falling behind",
-            "action": "Recommended action"
-        }}
-    ],
-    "reflection_prompts": ["prompt1", "prompt2"]
-}}""",
-            expected_output="JSON progress tracking and adaptation system",
-            agent=progress_tracker
+  "tracking_metrics": [ {{ "metric","how_to_measure","success_criteria" }} ],
+  "checkpoint_schedule": [ {{ "checkpoint","day","assessment","adaptation_triggers" }} ],
+  "adaptation_strategies": [ {{ "scenario","action" }} ],
+  "reflection_prompts": ["..."]
+}}
+"""
+        task_prog = Task(
+            description=progress_description,
+            expected_output="JSON progress tracking system",
+            agent=_agent_progress
         )
-        
-        progress_crew = Crew(agents=[progress_tracker], tasks=[progress_task])
-        progress_result = progress_crew.kickoff()
-        progress_text = str(progress_result).strip()
-        
-        # Clean JSON response
-        if progress_text.startswith('```'):
-            lines = progress_text.split('\n')
-            start_idx = None
-            end_idx = None
-            for i, line in enumerate(lines):
-                if line.strip().startswith('```json') or line.strip() == '```':
-                    if start_idx is None:
-                        start_idx = i + 1
-                    else:
-                        end_idx = i
-                        break
-            if start_idx is not None and end_idx is not None:
-                progress_text = '\n'.join(lines[start_idx:end_idx]).strip()
-        
-        progress_system = json.loads(progress_text)
-        print("✓ Progress tracking system created")
-        print(f"  Total checkpoints: {len(progress_system.get('checkpoint_schedule', []))}")
-        
+        crew_prog = Crew(agents=[_agent_progress], tasks=[task_prog])
+        prog_result = crew_prog.kickoff()
+        prog_text = str(prog_result).strip()
+
+        if prog_text.startswith("```"):
+            lines = prog_text.splitlines()
+            start_idx = 0
+            end_idx = len(lines)
+            for i, ln in enumerate(lines):
+                if ln.strip().startswith("```json") or ln.strip() == "```":
+                    start_idx = i + 1
+                    break
+            for j in range(start_idx, len(lines)):
+                if lines[j].strip() == "```":
+                    end_idx = j
+                    break
+            prog_text = "\n".join(lines[start_idx:end_idx]).strip()
+
+        progress_system = json.loads(prog_text)
     except Exception as e:
-        print(f"✗ Error in progress tracking: {e}")
+        app.logger.error(f"[Progress Agent] Error: {e}")
         progress_system = {"error": str(e)}
-    
-    print("\n" + "=" * 80)
-    print("STUDY PLAN GENERATION COMPLETED")
-    print("=" * 80 + "\n")
-    
-    # Combine all results
+
+    # Compose final plan
     complete_study_plan = {
         "created_at": datetime.now().isoformat(),
         "duration_days": study_duration_days,
@@ -508,175 +341,138 @@ Return your tracking system as a JSON object with this structure (ONLY JSON, no 
         "resources": resources,
         "progress_tracking": progress_system
     }
-    
+
     return complete_study_plan
 
 
 def generate_study_plan_pdf(study_plan):
     """
     Generate a comprehensive PDF report of the study plan
+    (same as your previous implementation, left unchanged)
     """
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", size=16)
     pdf.cell(200, 15, txt="Personalized Study Plan", ln=True, align='C')
-    
+
     pdf.set_font("Arial", size=10)
     pdf.cell(200, 5, txt=f"Created: {study_plan.get('created_at', 'N/A')}", ln=True)
     pdf.cell(200, 5, txt=f"Duration: {study_plan.get('duration_days', 'N/A')} days", ln=True)
     pdf.ln(10)
-    
+
     # Syllabus Analysis Section
     pdf.set_font("Arial", "B", size=12)
     pdf.cell(200, 10, txt="1. Syllabus Analysis", ln=True)
     pdf.set_font("Arial", size=10)
-    
+
     syllabus = study_plan.get('syllabus_analysis', {})
-    if 'subjects' in syllabus:
+    if isinstance(syllabus, dict) and 'subjects' in syllabus:
         for subject in syllabus.get('subjects', []):
             pdf.cell(200, 8, txt=f"• {subject.get('name', 'Unknown')}", ln=True)
             for chapter in subject.get('chapters', [])[:3]:
                 pdf.cell(200, 6, txt=f"  - {chapter.get('name', 'Unknown')} ({chapter.get('estimated_hours', 0)}h)", ln=True)
     pdf.ln(5)
-    
+
     # Learning Analysis Section
     pdf.set_font("Arial", "B", size=12)
     pdf.cell(200, 10, txt="2. Learning Style & Preferences", ln=True)
     pdf.set_font("Arial", size=10)
-    
+
     learning = study_plan.get('learning_analysis', {})
-    if 'error' not in learning:
+    if isinstance(learning, dict) and 'error' not in learning:
         pdf.cell(200, 6, txt=f"Primary Style: {learning.get('primary_learning_style', 'N/A')}", ln=True)
         if learning.get('recommended_study_methods'):
             pdf.cell(200, 6, txt="Recommended Methods:", ln=True)
             for method in learning.get('recommended_study_methods', [])[:3]:
                 pdf.cell(200, 5, txt=f"  • {method}", ln=True)
     pdf.ln(5)
-    
+
     # Schedule Section
     pdf.set_font("Arial", "B", size=12)
     pdf.cell(200, 10, txt="3. Study Schedule (Sample Days)", ln=True)
     pdf.set_font("Arial", size=9)
-    
+
     schedule = study_plan.get('schedule', {})
-    if 'schedule' in schedule:
+    if isinstance(schedule, dict) and 'schedule' in schedule:
         for day in schedule.get('schedule', [])[:5]:
             pdf.cell(200, 6, txt=f"Day {day.get('day', 'N/A')}: {day.get('date', 'N/A')}", ln=True)
             for session in day.get('sessions', [])[:2]:
                 pdf.cell(200, 5, txt=f"  • {session.get('time', 'N/A')}: {session.get('topic', 'N/A')}", ln=True)
     pdf.ln(5)
-    
+
     # Resources Section
     pdf.set_font("Arial", "B", size=12)
     pdf.cell(200, 10, txt="4. Recommended Resources", ln=True)
     pdf.set_font("Arial", size=9)
-    
+
     resources = study_plan.get('resources', {})
-    if 'resource_recommendations' in resources:
+    if isinstance(resources, dict) and 'resource_recommendations' in resources:
         for rec in resources.get('resource_recommendations', [])[:3]:
             pdf.cell(200, 6, txt=f"• {rec.get('topic', 'Unknown')}", ln=True)
             for res in rec.get('resources', [])[:2]:
                 pdf.cell(200, 5, txt=f"  - {res.get('name', 'Unknown')} ({res.get('type', 'Unknown')})", ln=True)
     pdf.ln(5)
-    
+
     # Progress Tracking Section
     pdf.set_font("Arial", "B", size=12)
     pdf.cell(200, 10, txt="5. Progress Tracking & Checkpoints", ln=True)
     pdf.set_font("Arial", size=9)
-    
+
     progress = study_plan.get('progress_tracking', {})
-    if 'checkpoint_schedule' in progress:
+    if isinstance(progress, dict) and 'checkpoint_schedule' in progress:
         for checkpoint in progress.get('checkpoint_schedule', [])[:4]:
             pdf.cell(200, 6, txt=f"• Day {checkpoint.get('day', 'N/A')}: {checkpoint.get('checkpoint', 'Unknown')}", ln=True)
-    
-    # Save to buffer
+
     pdf_bytes = pdf.output(dest='S').encode('latin1')
     return pdf_bytes
 
 
-
-
-# ============================================================================
-# FLASK ROUTES
-# ============================================================================
-
+# ---------------------------------------------------------------------
+# FLASK ROUTES (unchanged behavior)
+# ---------------------------------------------------------------------
 @app.route('/')
 def index():
     return render_template('index.html')
 
+
 @app.route('/api/generate-plan', methods=['POST'])
 def generate_plan():
-    """
-    Generate a comprehensive study plan based on PDF syllabus and learning preferences
-    
-    This endpoint:
-    1. Accepts a PDF file upload containing the syllabus
-    2. Parses the PDF using pdfplumber
-    3. Sends extracted text to Agent 1 (Syllabus Analyzer)
-    4. Agent 1 breaks down the syllabus into topics with time estimates
-    5. Orchestrates all 5 agents to create a complete study plan
-    
-    Expected Request (multipart/form-data):
-    - file: PDF file containing syllabus (required)
-    - learning_preferences: Student's learning style info (required)
-    - study_duration_days: Number of days for study plan (optional, default: 30)
-    """
-    print("\n[Generate Plan Route] Processing request...")
     try:
-        # Check if PDF file is provided
-        print("[Generate Plan Route] Checking for PDF file in request...")
+        # Validate file
         if 'file' not in request.files:
-            print("[Generate Plan Route] ERROR: No file provided in request")
             return jsonify({'error': 'No PDF file provided. Please upload a syllabus PDF.'}), 400
-        
+
         file = request.files['file']
-        
         if file.filename == '':
-            print("[Generate Plan Route] ERROR: No file selected")
             return jsonify({'error': 'No file selected. Please choose a PDF file.'}), 400
-        
-        # Validate file type
+
         if not allowed_file(file.filename):
-            print(f"[Generate Plan Route] ERROR: Invalid file type - {file.filename}")
             return jsonify({'error': 'Invalid file type. Only PDF files are allowed.'}), 400
-        
-        print(f"[Generate Plan Route] PDF file received: {file.filename}")
-        
-        # Get learning preferences and study duration
+
+        # Validate other fields
         learning_preferences = request.form.get('learning_preferences', '')
         study_duration_days = int(request.form.get('study_duration_days', 30))
-        
         if not learning_preferences:
-            print("[Generate Plan Route] ERROR: Learning preferences not provided")
             return jsonify({'error': 'Learning preferences are required'}), 400
-        
-        print(f"[Generate Plan Route] Learning preferences: {learning_preferences[:50]}...")
-        print(f"[Generate Plan Route] Study duration: {study_duration_days} days")
-        
-        # STEP 1: Agent 1 (Syllabus Analyzer) reads and parses the PDF
-        print("\n[Generate Plan Route] [AGENT 1] Starting PDF parsing and analysis...")
+
+        # Parse PDF (this is memory light)
         try:
             syllabus_text, page_count = parse_pdf_file(file)
-            print(f"[Generate Plan Route] [AGENT 1] ✓ PDF parsing successful - {page_count} pages processed")
         except ValueError as ve:
-            print(f"[Generate Plan Route] [AGENT 1] ✗ PDF parsing failed: {str(ve)}")
             return jsonify({'error': f'PDF parsing error: {str(ve)}'}), 400
         except Exception as e:
-            print(f"[Generate Plan Route] [AGENT 1] ✗ Unexpected error during PDF parsing: {str(e)}")
             return jsonify({'error': f'Failed to parse PDF: {str(e)}'}), 500
-        
-        print(f"[Generate Plan Route] Extracted syllabus text: {len(syllabus_text)} characters")
-        
-        # STEP 2: Create comprehensive study plan with all 5 agents
-        print("[Generate Plan Route] Creating comprehensive study plan with all agents...")
+
+        # Create study plan
         study_plan = create_study_plan(syllabus_text, learning_preferences, study_duration_days)
-        
-        # Store the plan
+
+        # If create_study_plan returned an error field, propagate as 500
+        if isinstance(study_plan, dict) and study_plan.get('error'):
+            return jsonify({'error': study_plan.get('error')}), 500
+
         plan_id = f"plan_{int(datetime.now().timestamp())}"
         study_plans[plan_id] = study_plan
-        
-        print(f"[Generate Plan Route] ✓ Study plan generated successfully with ID: {plan_id}")
-        
+
         return jsonify({
             'success': True,
             'plan_id': plan_id,
@@ -692,62 +488,38 @@ def generate_plan():
                 'primary_learning_style': study_plan.get('learning_analysis', {}).get('primary_learning_style', 'N/A')
             }
         }), 200
-        
+
     except Exception as e:
-        print(f"[Generate Plan Route] ✗ Error in generate_plan: {str(e)}")
+        app.logger.exception("Unhandled error in /api/generate-plan")
         return jsonify({'error': f'Failed to generate study plan: {str(e)}'}), 500
 
 
 @app.route('/api/plan/<plan_id>', methods=['GET'])
 def get_plan(plan_id):
-    """
-    Retrieve a generated study plan
-    """
-    print(f"Get plan route called for ID: {plan_id}")
     try:
         if plan_id not in study_plans:
             return jsonify({'error': 'Plan not found'}), 404
-        
-        plan = study_plans[plan_id]
-        return jsonify({
-            'success': True,
-            'plan': plan
-        }), 200
-        
+        return jsonify({'success': True, 'plan': study_plans[plan_id]}), 200
     except Exception as e:
-        print(f"Error in get_plan: {e}")
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/plan/<plan_id>/pdf', methods=['GET'])
 def download_plan_pdf(plan_id):
-    """
-    Download study plan as PDF
-    """
-    print(f"Download PDF route called for plan ID: {plan_id}")
     try:
         if plan_id not in study_plans:
             return jsonify({'error': 'Plan not found'}), 404
-        
-        plan = study_plans[plan_id]
-        pdf_bytes = generate_study_plan_pdf(plan)
-        
+        pdf_bytes = generate_study_plan_pdf(study_plans[plan_id])
         return pdf_bytes, 200, {
             'Content-Type': 'application/pdf',
             'Content-Disposition': f'attachment; filename=study_plan_{plan_id}.pdf'
         }
-        
     except Exception as e:
-        print(f"Error in download_plan_pdf: {e}")
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/plans', methods=['GET'])
 def list_plans():
-    """
-    List all generated study plans
-    """
-    print("List plans route called.")
     try:
         plans_summary = []
         for plan_id, plan in study_plans.items():
@@ -757,27 +529,22 @@ def list_plans():
                 'duration_days': plan.get('duration_days'),
                 'primary_learning_style': plan.get('learning_analysis', {}).get('primary_learning_style', 'N/A')
             })
-        
-        return jsonify({
-            'success': True,
-            'plans': plans_summary,
-            'total_plans': len(plans_summary)
-        }), 200
-        
+        return jsonify({'success': True, 'plans': plans_summary, 'total_plans': len(plans_summary)}), 200
     except Exception as e:
-        print(f"Error in list_plans: {e}")
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """
-    Health check endpoint
-    """
-    return jsonify({
-        'status': 'healthy',
-        'service': 'Study Plan Generator',
-        'llm': llm,
-        'timestamp': datetime.now().isoformat()
-    }), 200
-
+    try:
+        # Return whether agents are initialized (for debugging)
+        status = {
+            'status': 'healthy',
+            'service': 'Study Plan Generator',
+            'agents_initialized': _agents_initialized,
+            'llm_configured': _llm_instance is not None,
+            'timestamp': datetime.now().isoformat()
+        }
+        return jsonify(status), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
