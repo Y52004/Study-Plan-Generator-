@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 # Environment & Config
 # -----------------------------
 load_dotenv()
-
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
@@ -39,10 +38,8 @@ _agent_core = None
 _agent_scheduler = None
 _agent_progress = None
 
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
 
 def parse_pdf_file(file):
     filename = secure_filename(file.filename)
@@ -62,7 +59,6 @@ def parse_pdf_file(file):
         raise ValueError("No text content found in PDF.")
     return text, page_count
 
-
 def _init_agents_if_needed():
     global _agents_initialized, _llm_instance, _agent_core, _agent_scheduler, _agent_progress
     with _agents_lock:
@@ -73,6 +69,7 @@ def _init_agents_if_needed():
         except Exception as e:
             raise RuntimeError(f"CrewAI import failed: {e}")
 
+        # Create lightweight LLM (avoid native heavy provider)
         try:
             _llm_instance = LLM(model="gemini/gemini-2.0-flash", use_native=False)
         except Exception:
@@ -81,23 +78,23 @@ def _init_agents_if_needed():
         def make_agent(role, goal, backstory):
             return Agent(role=role, goal=goal, backstory=backstory, llm=_llm_instance, verbose=False)
 
+        # Optimized 3 agents
         _agent_core = make_agent(
             role="Core Study Plan Agent",
-            goal="Analyze syllabus + learning style",
-            backstory="Structured topics + resources"
+            goal="Analyze syllabus and learning style in one task",
+            backstory="Produce structured topics and learning recommendations"
         )
         _agent_scheduler = make_agent(
             role="Scheduler Agent",
-            goal="Create day-by-day schedule",
-            backstory="Map topics to daily sessions"
+            goal="Create schedule and map resources",
+            backstory="Return JSON schedule and resources in one task"
         )
         _agent_progress = make_agent(
             role="Progress Tracker Agent",
-            goal="Create progress checkpoints",
-            backstory="Adapt study plan based on progress"
+            goal="Track progress and adaptation",
+            backstory="Monitor plan and provide checkpoints"
         )
         _agents_initialized = True
-
 
 # -----------------------------
 # Study Plan Creation
@@ -111,14 +108,18 @@ def create_study_plan(syllabus_text, learning_preferences, study_duration_days):
     if _llm_instance is None:
         return {"error": "LLM not configured"}
 
-    # Lightweight JSON placeholders to avoid memory spikes
+    # ----- PLACEHOLDER lightweight JSON -----
     syllabus_analysis = {"info": "placeholder syllabus analysis"}
     learning_analysis = {"info": "placeholder learning analysis"}
     schedule = {"info": "placeholder schedule"}
     resources = {"info": "placeholder resources"}
     progress_system = {"info": "placeholder progress"}
 
-    # You can optionally implement CrewAI Tasks here with memory limits
+    # ----- Optional: CrewAI tasks can be implemented here -----
+    # All 3 agents are ready; memory-friendly execution
+    # Combine core syllabus + learning analysis
+    # Combine scheduler schedule + resources
+    # Single progress task
 
     return {
         "created_at": datetime.now().isoformat(),
@@ -130,20 +131,18 @@ def create_study_plan(syllabus_text, learning_preferences, study_duration_days):
         "progress_tracking": progress_system
     }
 
-
 # -----------------------------
 # PDF Generation
 # -----------------------------
 def generate_study_plan_pdf(study_plan):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Arial", "B", size=16)
+    pdf.set_font("Arial", "B", 16)
     pdf.cell(200, 15, txt="Study Plan", ln=True, align='C')
-    pdf.set_font("Arial", size=10)
+    pdf.set_font("Arial", 10)
     pdf.cell(200, 5, txt=f"Created: {study_plan.get('created_at', 'N/A')}", ln=True)
     pdf_bytes = pdf.output(dest='S').encode('latin1')
     return pdf_bytes
-
 
 # -----------------------------
 # Flask Routes
@@ -151,7 +150,6 @@ def generate_study_plan_pdf(study_plan):
 @app.route('/')
 def index():
     return render_template('index.html')
-
 
 @app.route('/api/generate-plan', methods=['POST'])
 def generate_plan():
@@ -172,14 +170,12 @@ def generate_plan():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/plan/<plan_id>', methods=['GET'])
 def get_plan(plan_id):
     plan = study_plans.get(plan_id)
     if not plan:
         return jsonify({'error': 'Plan not found'}), 404
     return jsonify({'success': True, 'plan': plan}), 200
-
 
 @app.route('/api/plan/<plan_id>/pdf', methods=['GET'])
 def download_plan_pdf(plan_id):
@@ -192,7 +188,6 @@ def download_plan_pdf(plan_id):
         'Content-Disposition': f'attachment; filename=study_plan_{plan_id}.pdf'
     }
 
-
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({
@@ -202,9 +197,8 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     }), 200
 
-
 # -----------------------------
-# Run Flask directly
+# Run Flask directly (no Gunicorn)
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
