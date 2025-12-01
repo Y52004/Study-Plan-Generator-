@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Study Plan Generator</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <!-- Home Screen -->
+    <div id="home-screen" class="screen active">
+        <div class="home-container">
+            <div class="home-header">
+                <h1>Study Plan Generator</h1>
+                <p class="subtitle">AI-Powered Personalized Learning</p>
+            </div>
+
+            <div class="features-grid">
+                <div class="feature-card">
+                    <h3>PDF Upload</h3>
+                    <p>Upload your syllabus and let AI analyze it</p>
+                </div>
+
+                <div class="feature-card">
+                    <h3>Personalized Plans</h3>
+                    <p>Get customized study schedules based on your learning style</p>
+                </div>
+
+                <div class="feature-card">
+                    <h3>Smart Scheduling</h3>
+                    <p>Day-by-day breakdown with realistic time management</p>
+                </div>
+
+                <div class="feature-card">
+                    <h3>Adaptive System</h3>
+                    <p>Progress tracking and plan adjustments powered by AI agents</p>
+                </div>
+            </div>
+
+            <button class="btn-primary" onclick="showPlanForm()">
+                Get Started
+            </button>
+        </div>
+    </div>
+
+    <!-- Study Plan Form Screen -->
+    <div id="plan-form-screen" class="screen">
+        <nav class="navbar">
+            <h2>Generate Plan</h2>
+            <button onclick="backToHome()" class="back-btn">Back</button>
+        </nav>
+
+        <div class="container">
+            <div class="form-card">
+                <form id="study-plan-form" class="study-plan-form">
+                    <!-- PDF Upload -->
+                    <div class="form-section">
+                        <h3>Upload Syllabus</h3>
+                        <div class="file-input-wrapper">
+                            <input 
+                                type="file" 
+                                id="syllabus-pdf" 
+                                name="file"
+                                accept=".pdf"
+                                required
+                            />
+                            <p class="file-info" id="file-preview">No file selected</p>
+                        </div>
+                    </div>
+
+                    <!-- Learning Preferences -->
+                    <div class="form-section">
+                        <h3>Your Preferences</h3>
+                        
+                        <div class="form-group">
+                            <label>Learning Style</label>
+                            <select id="learning-style" name="learning_style" required>
+                                <option value="">Select...</option>
+                                <option value="visual">Visual</option>
+                                <option value="auditory">Auditory</option>
+                                <option value="reading-writing">Reading/Writing</option>
+                                <option value="kinesthetic">Kinesthetic</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Study Hours Per Day</label>
+                            <select id="study-hours" name="study_hours" required>
+                                <option value="">Select...</option>
+                                <option value="2-3">2-3 hours</option>
+                                <option value="4-6">4-6 hours</option>
+                                <option value="6-8">6-8 hours</option>
+                                <option value="8+">8+ hours</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Learning Pace</label>
+                            <select id="learn-pace" name="learning_pace" required>
+                                <option value="">Select...</option>
+                                <option value="slow">Slow</option>
+                                <option value="moderate">Moderate</option>
+                                <option value="fast">Fast</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Additional Notes</label>
+                            <textarea 
+                                id="additional-prefs" 
+                                name="learning_preferences" 
+                                placeholder="Any additional preferences..."
+                                rows="3"
+                                required
+                            ></textarea>
+                        </div>
+                    </div>
+
+                    <!-- Study Duration -->
+                    <div class="form-section">
+                        <h3>Study Duration</h3>
+                        <div class="form-group">
+                            <label>Total Days</label>
+                            <input 
+                                type="number" 
+                                id="study-duration" 
+                                name="study_duration_days"
+                                min="7"
+                                max="365"
+                                value="30"
+                                required
+                            />
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn-primary btn-large">
+                        Generate Plan
+                    </button>
+                </form>
+
+                <div id="form-status"></div>
+                <div id="form-loader" class="loader" style="display: none">
+                    <div class="spinner"></div>
+                    <p>Generating your study plan...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Study Plan Results Screen -->
+    <div id="results-screen" class="screen">
+        <nav class="navbar">
+            <h2>Your Study Plan</h2>
+            <button onclick="backToHome()" class="back-btn">Back</button>
+        </nav>
+
+        <div class="container results-container">
+            <div class="results-card">
+                <h3>Plan Summary</h3>
+                <div class="summary-grid">
+                    <div class="summary-item">
+                        <label>Plan ID</label>
+                        <p id="summary-plan-id">-</p>
+                    </div>
+                    <div class="summary-item">
+                        <label>Duration</label>
+                        <p id="summary-duration">-</p>
+                    </div>
+                    <div class="summary-item">
+                        <label>Total Hours</label>
+                        <p id="summary-hours">-</p>
+                    </div>
+                    <div class="summary-item">
+                        <label>Learning Style</label>
+                        <p id="summary-style">-</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="results-actions">
+                <button class="btn-secondary" onclick="downloadPlan()">
+                    Download PDF
+                </button>
+                <button class="btn-secondary" onclick="viewPlanDetails()">
+                    View Details
+                </button>
+            </div>
+
+            <div id="plan-details" class="results-card" style="display: none;">
+                <h3>Detailed Plan</h3>
+                <div id="details-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast"></div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
