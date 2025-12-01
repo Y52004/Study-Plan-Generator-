@@ -14,8 +14,9 @@ gunicorn>=21.0.0
 # LLM + CrewAI
 litellm>=1.0.0
 google-generativeai>=0.7.0
-crewai[google-genai]==1.6.2
+crewai>=1.6.0,<1.7
 
 # Optional utilities
 pydantic>=2.0.0
 python-docx>=0.8.10
+
