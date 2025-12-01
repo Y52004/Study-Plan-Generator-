@@ -798,5 +798,6 @@ if __name__ == '__main__':
     print("=" * 80 + "\n")
     
     port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
     print(f"Starting Flask app on http://0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=port, debug=debug_mode, use_reloader=False)
