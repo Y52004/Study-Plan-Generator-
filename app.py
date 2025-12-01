@@ -797,8 +797,8 @@ if __name__ == '__main__':
     print("✓ Ready to generate personalized study plans!")
     print("=" * 80 + "\n")
     
-   if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
     print(f"Starting Flask app on http://0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port, debug=True)
-
+    # Render requires debug=False for production
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
