@@ -781,24 +781,3 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     }), 200
 
-
-
-if __name__ == '__main__':
-    print("\n" + "=" * 80)
-    print("STUDY PLAN GENERATOR - POWERED BY CREWAI")
-    print("=" * 80)
-    print("\n✓ All 5 CrewAI Agents initialized:")
-    print("  1. Syllabus Analyzer Agent")
-    print("  2. Learning Style Assessor Agent")
-    print("  3. Schedule Architect Agent")
-    print("  4. Resource Recommender Agent")
-    print("  5. Progress Tracker & Adaptation Agent")
-    print("\n✓ LLM: Gemini 2.0 Flash")
-    print("✓ Ready to generate personalized study plans!")
-    print("=" * 80 + "\n")
-    
-    port = int(os.environ.get('PORT', 5000))
-    debug_mode = os.environ.get('FLASK_ENV') == 'development'
-    print(f"Starting Flask app on http://0.0.0.0:{port}")
-    # Render requires debug=False for production
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
